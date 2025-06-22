@@ -1,83 +1,118 @@
-**architecture.md\***architecture.md\*\*
-
 # ServerlessLLM MVP Architecture
 
-A low‐latency, OpenAI-compatible, multi-backend serverless LLM inference system—built for extreme performance.
+An OpenAI-compatible, low-latency serverless LLM inference system built for extreme performance.
 
 ---
 
-## 1. System Overview
+## 1. Simplified Component Diagram
 
 ```mermaid
-flowchart LR
-  Client[Client<br/>(OpenAI API)]
-  Orch[Orchestrator<br/>(Rust)]
-  KV[Metadata KV<br/>(etcd/Redis)]
-  CS[Checkpoint Store<br/>(S3/Blob/HF)]
-  Agent[Agent Daemon<br/>(Rust + Zig)]
+flowchart TB
+  subgraph Client
+    C[Client<br/>(OpenAI API)]
+  end
 
-  Client -->|REST/gRPC| Orch
-  Orch --> KV
-  Orch --> CS
-  Orch --> Agent
-  Agent --> KV
-  Agent --> CS
-  Agent --> Orch
+  subgraph Orchestrator
+    API[API Gateway]
+    SCH[Scheduler]
+    ING[Model Ingestion]
+    DL[Fan-out Downloader]
+  end
+
+  subgraph KV["Metadata Store<br/>(etcd/Redis)"]
+    KVData[(model→agent metadata)]
+  end
+
+  subgraph Store["Checkpoint Store<br/>(S3/Blob/HF)"]
+    IDX[(.idx files)]
+    BIN[(.bin files)]
+  end
+
+  subgraph Agent["Agent Daemon<br/>(Rust + Zig)"]
+    HB[Heartbeat]
+    DQ[Download Queue]
+    LT[Loader (Zig)]
+    IS[Inference μService]
+  end
+
+  C -->|REST/gRPC| API
+  API --> SCH
+  SCH --> KVData
+  SCH --> Store
+  SCH --> DL
+  ING --> Store
+  DL --> DQ
+  API --> IS
+  IS --> API
+  DQ --> LT
+  LT --> IS
+  HB --> KVData
+  IS --> KVData
+  LT --> Store
 ```
 
 ---
 
-## 2. Components & Tech Stack
+## 2. Component Responsibilities & Tech Stack
 
-| Component                   | Responsibility                                                          | Language / Tech          |
-| --------------------------- | ----------------------------------------------------------------------- | ------------------------ |
-| **Checkpoint Converter**    | raw HF/PyTorch → optimized `.idx` + `.bin`                              | Python + Rust            |
-| **Model Ingestion Service** | on–demand fetch HF checkpoint → convert → upload to store               | Python                   |
-| **Metadata KV Store**       | `model_id → [ {agent,cache,kv_hit,queue} ]`                             | etcd (Go) or Redis       |
-| **Orchestrator / API GW**   | OpenAI spec endpoints, scheduler, fan-out downloader, ingestion trigger | Rust (Tokio, warp)       |
-| **Agent Daemon**            | heartbeat, download queue, multi-tier loader, inference μService        | Rust (control-plane)     |
-| **Multi-Tier Loader**       | DRAM/NVMe/S3 → pinned buf → CUDA DMA                                    | Zig (data-plane)         |
-| **Inference μService**      | OpenAI spec serve → backend adapter plugins (vLLM/Triton/others)        | Rust + FFI (C++/Py)      |
-| **Checkpoint Store**        | stores optimized `.idx` + `.bin`                                        | S3 / Azure Blob / HF     |
-| **Monitoring**              | metrics export (load times, kv hits, queue lengths)                     | Prometheus / Grafana     |
-| **CI/CD Pipeline**          | trains/fine-tunes → checkpoint conversion → upload optimized artifacts  | GitHub Actions / Jenkins |
+| Component               | Responsibility                                                           | Tech Stack               |
+| ----------------------- | ------------------------------------------------------------------------ | ------------------------ |
+| **Client**              | Sends OpenAI-spec inference requests                                     | Any (Python/JS/etc.)     |
+| **API Gateway**         | Receives `/v1/...` calls, handles authentication                         | Rust (Tokio + warp)      |
+| **Scheduler**           | Picks best Agent by cache_level, kv_hit_rate, queue_len, startup_cost    | Rust                     |
+| **Model Ingestion**     | On-demand HF raw checkpoint → Convert → Upload optimized (`.idx`+`.bin`) | Python + Rust lib        |
+| **Fan-out Downloader**  | Parallel HTTP-Range download into Agents’ NVMe                           | Rust                     |
+| **Metadata Store (KV)** | Stores `model_id → [{agent_id, cache_level, kv_hit_rate, queue_len}]`    | etcd (Go) or Redis       |
+| **Checkpoint Store**    | Holds optimized artifacts (`.idx`, `.bin`)                               | S3 / Azure Blob / HF Hub |
+| **Agent Daemon**        |
+
+• Heartbeat to KV  
+ • Download Queue worker  
+ • Multi-Tier Loader (Zig)  
+ • Inference μService (Rust) | Rust + Zig |
+| **Multi-Tier Loader** | DRAM / NVMe / S3 → pinned buffer → CUDA DMA → GPU memory | Zig (direct syscalls) |
+| **Inference μService** | Exposes OpenAI endpoints, calls backend adapters (vLLM/Triton/others) | Rust + FFI (C++/Py) |
+| **Monitoring** | Prometheus metrics (load times, kv hits, queue lengths) | Prometheus / Grafana |
+| **CI/CD Pipeline** | Trains/fine-tunes → Checkpoint conversion → Upload optimized artifacts | GitHub Actions / Jenkins |
 
 ---
 
 ## 3. Request Flow
 
-```mermaid
-sequenceDiagram
-  participant C as Client
-  participant O as Orchestrator
-  participant KV as Metadata KV
-  participant CS as Checkpoint Store
-  participant A as Agent
+1. **Client** → API Gateway:  
+   `POST /v1/chat/completions` (OpenAI spec)
 
-  C->>O: POST /v1/chat/completions
-  O->>CS: HEAD model_id.idx? (.bin?)
-  alt optimized missing
-    O->>HF: download raw checkpoint
-    O->>Conv: convert → .idx + .bin
-    Conv->>CS: upload optimized artifacts
-  end
-  O->>KV: get agents for model_id
-  O->>O: score(agent) = α·cache_level – β·kv_hit_rate + γ·queue_len + δ·(size/bw)
-  O->>A: fan-out download chunks? (if cache_level > 0)
-  O->>A: POST /load {model_id}
-  O->>A: POST /v1/chat/completions {…}
-  A->>A: loader (DRAM→NVMe→S3) → GPU
-  A->>A: generate tokens via backend
-  A->>O: stream tokens
-  O->>C: proxy stream to client
-```
+2. **API Gateway** → Scheduler:  
+   • Check Metadata Store for agents with `model_id`  
+   • If no optimized files in Checkpoint Store, invoke Model Ingestion  
+   • Compute `score(agent)` = α·cache_level – β·kv_hit + γ·queue_len + δ·(size/bw)  
+   • Select Agent A
+
+3. **Scheduler** → Fan-out Downloader:  
+   • If no agent has model in DRAM/NVMe, download `.bin` chunks in parallel into N agents
+
+4. **Scheduler** → Agent A:  
+   `POST /load {model_id}`
+
+5. **Agent A**  
+   a. **Loader** (Zig): multi-tier read → GPU  
+   b. **Inference μService** (Rust): serves chat completion, updates kv_hit_rate
+
+6. **Agent A** → API Gateway:  
+   Streams tokens back (SSE/gRPC)
+
+7. **API Gateway** → Client:  
+   Proxies token stream as OpenAI spec
 
 ---
 
-## 4. Scalability & Extensibility
+## 4. Next Steps & Extension Points
 
-- **Multi-Backend Support**: pluggable adapters for vLLM, Triton, llama.cpp, etc.
-- **Stateless Orchestrator**: horizontal scale behind load-balancer.
-- **Distributed Metadata**: resilient etcd/Redis cluster.
-- **Agent Auto-Discovery**: via heartbeats.
-- **Future Extensions**: live migration, layered streaming, RDMA P2P, quantization (see roadmap.md).oadmap features can be added modularly.
+- **Multi-Backend Adapters**: easily add new inference engines
+- **Live Migration**: zero-downtime in-flight inference moves
+- **Layered Shard Streaming**: overlap load + infer
+- **P2P / RDMA**: peer fetch of chunks
+- **Quantization**: compressed weights + on-GPU decompress
+- **Autoscaling**: popularity predictor + agent pool scaling
+- **QoS**: tenant isolation, rate limiting
+- **Observability**: eBPF telemetry, Grafana dashboards
