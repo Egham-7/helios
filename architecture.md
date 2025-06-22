@@ -1,96 +1,83 @@
-**architecture.md**
+**architecture.md\***architecture.md\*\*
 
 # ServerlessLLM MVP Architecture
 
-A minimal‐viable, OpenAI‐compatible serverless LLM inference system.
+A low‐latency, OpenAI-compatible, multi-backend serverless LLM inference system—built for extreme performance.
 
-## 1. API
+---
 
-All clients speak the OpenAI API spec.  
-Example endpoint:
+## 1. System Overview
 
-• POST /v1/chat/completions  
- – Request/response match OpenAI’s JSON schema  
- – Supports streaming via `text/event-stream`
+```mermaid
+flowchart LR
+  Client[Client<br/>(OpenAI API)]
+  Orch[Orchestrator<br/>(Rust)]
+  KV[Metadata KV<br/>(etcd/Redis)]
+  CS[Checkpoint Store<br/>(S3/Blob/HF)]
+  Agent[Agent Daemon<br/>(Rust + Zig)]
 
-## 2. Components
+  Client -->|REST/gRPC| Orch
+  Orch --> KV
+  Orch --> CS
+  Orch --> Agent
+  Agent --> KV
+  Agent --> CS
+  Agent --> Orch
+```
 
-1. **Client**  
-   • Calls `/v1/chat/completions` on the Orchestrator
+---
 
-2. **Orchestrator / API Gateway**  
-   • Exposes OpenAI endpoints (`/v1/models/{model}/completions`, etc.)  
-   • Metadata store (Redis/etcd):  
-    &nbsp;&nbsp;`model_id → [ { agent_id, cache_level, kv_hit_rate } ]`  
-   • Scheduler: picks the “best” agent by minimizing
+## 2. Components & Tech Stack
 
-   ```
-   score(agent) = α·cache_level
-                  – β·kv_hit_rate
-                  + γ·queue_wait
-                  + δ·(model_size/bandwidth)
-   ```
+| Component                   | Responsibility                                                          | Language / Tech          |
+| --------------------------- | ----------------------------------------------------------------------- | ------------------------ |
+| **Checkpoint Converter**    | raw HF/PyTorch → optimized `.idx` + `.bin`                              | Python + Rust            |
+| **Model Ingestion Service** | on–demand fetch HF checkpoint → convert → upload to store               | Python                   |
+| **Metadata KV Store**       | `model_id → [ {agent,cache,kv_hit,queue} ]`                             | etcd (Go) or Redis       |
+| **Orchestrator / API GW**   | OpenAI spec endpoints, scheduler, fan-out downloader, ingestion trigger | Rust (Tokio, warp)       |
+| **Agent Daemon**            | heartbeat, download queue, multi-tier loader, inference μService        | Rust (control-plane)     |
+| **Multi-Tier Loader**       | DRAM/NVMe/S3 → pinned buf → CUDA DMA                                    | Zig (data-plane)         |
+| **Inference μService**      | OpenAI spec serve → backend adapter plugins (vLLM/Triton/others)        | Rust + FFI (C++/Py)      |
+| **Checkpoint Store**        | stores optimized `.idx` + `.bin`                                        | S3 / Azure Blob / HF     |
+| **Monitoring**              | metrics export (load times, kv hits, queue lengths)                     | Prometheus / Grafana     |
+| **CI/CD Pipeline**          | trains/fine-tunes → checkpoint conversion → upload optimized artifacts  | GitHub Actions / Jenkins |
 
-   – cache_level: 0=DRAM, 1=NVMe, 2=remote  
-    – kv_hit_rate: recent per‐token KV‐cache hit ratio  
-   • Fan-out downloader: on cache‐miss, parallel HTTP-Range downloads into NVMe on N agents  
-   • Proxies OpenAI spec requests/responses to/from the selected Agent
-
-3. **Agent (per GPU-host)**  
-   • **Heartbeat**: every 1s reports to Orchestrator:  
-    – `cache_level` for each loaded model  
-    – recent `kv_hit_rate` (e.g., fraction of tokens served from GPU cache)  
-    – current load / queue length  
-   • **Download queue**: accepts chunk tasks via Redis/etcd  
-   • **Multi-Tier Model Loader** (Zig or prototype):
-
-   1. Try DRAM cache
-   2. Else read NVMe SSD via `io_uring`/direct‐I/O
-   3. Else HTTP-Range from S3/Blob  
-       → pinned host buffer → CUDA DMA into GPU  
-      • **Inference µService** (vLLM/Triton):  
-       – Exposes OpenAI endpoints  
-       – Streams tokens back, updates `kv_hit_rate`
-
-4. **Checkpoint Store**  
-   • Object storage (S3/Blob/HuggingFace Hub)  
-   • Holds optimized checkpoints:  
-    – `.idx` (tensor index: name, GPU_id, offset, size)  
-    – `.bin` (GPU-partitioned, chunked binaries)
+---
 
 ## 3. Request Flow
 
-```text
-Client
-  │ POST /v1/chat/completions
-  ▼
-Orchestrator
-  1. Lookup `model_id` in Redis/etcd → [agents…]
-     each agent record: {cache_level, kv_hit_rate, queue_len}
-  2. If no agent has model:
-       • fan-out downloads → NVMe on N agents
-       • update Redis/etcd
-  3. For each agent, compute score(agent)
-  4. Select agent A with lowest score
-  5. If agent A needs load:
-       • POST /load model to Agent A
-  6. Proxy POST /v1/chat/completions → Agent A
-  ▼
-Agent A
-  • Multi-Tier Loader → GPU memory
-  • vLLM/Triton serves chat completion
-     – updates `kv_hit_rate`
-  • Streams tokens back to Orchestrator
-  ▲
-Orchestrator proxies stream
-  ▲
-Client receives streamed tokens
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant O as Orchestrator
+  participant KV as Metadata KV
+  participant CS as Checkpoint Store
+  participant A as Agent
+
+  C->>O: POST /v1/chat/completions
+  O->>CS: HEAD model_id.idx? (.bin?)
+  alt optimized missing
+    O->>HF: download raw checkpoint
+    O->>Conv: convert → .idx + .bin
+    Conv->>CS: upload optimized artifacts
+  end
+  O->>KV: get agents for model_id
+  O->>O: score(agent) = α·cache_level – β·kv_hit_rate + γ·queue_len + δ·(size/bw)
+  O->>A: fan-out download chunks? (if cache_level > 0)
+  O->>A: POST /load {model_id}
+  O->>A: POST /v1/chat/completions {…}
+  A->>A: loader (DRAM→NVMe→S3) → GPU
+  A->>A: generate tokens via backend
+  A->>O: stream tokens
+  O->>C: proxy stream to client
 ```
 
-## 4. Key Properties
+---
 
-- **OpenAI-Spec Compliance**: drop-in replacement for `/v1/chat/completions`.
-- **Low Cold-Start**: optimized checkpoint + multi-tier loader.
-- **Locality- & Cache-Aware**: schedule by cache level, KV-cache hit rates, queue depth.
-- **Scalable**: agents auto-register via heartbeat; orchestrator is stateless.
-- **Extensible**: roadmap features can be added modularly.
+## 4. Scalability & Extensibility
+
+- **Multi-Backend Support**: pluggable adapters for vLLM, Triton, llama.cpp, etc.
+- **Stateless Orchestrator**: horizontal scale behind load-balancer.
+- **Distributed Metadata**: resilient etcd/Redis cluster.
+- **Agent Auto-Discovery**: via heartbeats.
+- **Future Extensions**: live migration, layered streaming, RDMA P2P, quantization (see roadmap.md).oadmap features can be added modularly.
