@@ -1,118 +1,90 @@
 # ServerlessLLM MVP Architecture
 
-An OpenAI-compatible, low-latency serverless LLM inference system built for extreme performance.
+A low-latency, OpenAI-compatible serverless LLM inference system using only Go and Zig for core components, and vLLM for model execution.
 
 ---
 
-## 1. Simplified Component Diagram
+## 1. Components & Tech Stack
 
-```mermaid
-flowchart TB
-  subgraph Client
-    C[Client<br/>(OpenAI API)]
-  end
+1. **Orchestrator**  
+   • Language: Go  
+   • Responsibilities:
 
-  subgraph Orchestrator
-    API[API Gateway]
-    SCH[Scheduler]
-    ING[Model Ingestion]
-    DL[Fan-out Downloader]
-  end
+   - Expose OpenAI-spec endpoints (`/v1/chat/completions`, `/v1/models/*`) via HTTP/gRPC
+   - Maintain in-memory metadata: which agents cache which models, their cache level, KV-cache hit rates, queue lengths
+   - On request:
+     1. Ensure optimized checkpoint exists (download raw HuggingFace checkpoint and convert it in-process)
+     2. Score agents by
+        ```
+        score = α·cache_level
+              – β·kv_hit_rate
+              + γ·queue_len
+              + δ·(model_size / bandwidth_tier)
+        ```
+     3. If no agent has model in DRAM/NVMe, fan-out HTTP-Range downloads of `.bin` chunks to multiple agents
+     4. Send `LoadModel(model_id)` RPC to chosen agent if needed
+     5. Forward the client’s `/v1/chat/completions` call to the agent; stream tokens back
+   - Metrics: expose Prometheus metrics for request latencies, cache hits, scheduling decisions
 
-  subgraph KV["Metadata Store<br/>(etcd/Redis)"]
-    KVData[(model→agent metadata)]
-  end
+2. **Agent Daemon**  
+   • Languages: Go (control plane) + Zig (data plane loader)  
+   • Responsibilities:
 
-  subgraph Store["Checkpoint Store<br/>(S3/Blob/HF)"]
-    IDX[(.idx files)]
-    BIN[(.bin files)]
-  end
+   - Heartbeat over gRPC to orchestrator with `{agent_id, model_id, cache_level, kv_hit_rate, queue_len}`
+   - Download-queue worker: accept chunk-download tasks via gRPC from orchestrator; write to NVMe
+   - Multi-Tier Loader (Zig):
+     1. Read from DRAM cache if present
+     2. Else read from NVMe SSD via `io_uring`/O_DIRECT
+     3. Else HTTP-Range from orchestrator/Checkpoint Store
+     4. Copy into pinned host buffer → `cudaMemcpyAsync` → GPU memory
+   - Inference launcher: spawn vLLM process (Python) with IPC or gRPC, point it at the loaded model
+   - Expose a minimal gRPC endpoint (`Infer(request) → token stream`) consumed by orchestrator
 
-  subgraph Agent["Agent Daemon<br/>(Rust + Zig)"]
-    HB[Heartbeat]
-    DQ[Download Queue]
-    LT[Loader (Zig)]
-    IS[Inference μService]
-  end
+3. **Checkpoint Store**  
+   • External object storage (S3, Azure Blob, or HuggingFace Hub)  
+   • Holds optimized artifacts per model:
 
-  C -->|REST/gRPC| API
-  API --> SCH
-  SCH --> KVData
-  SCH --> Store
-  SCH --> DL
-  ING --> Store
-  DL --> DQ
-  API --> IS
-  IS --> API
-  DQ --> LT
-  LT --> IS
-  HB --> KVData
-  IS --> KVData
-  LT --> Store
-```
+   - `model_id.idx` (tensor index)
+   - `model_id.bin` (GPU-partitioned chunks)
 
----
+4. **Inference Backend**  
+   • vLLM (Python/C++), running as a child process or sidecar of the Agent  
+   • Responsible for autoregressive token generation using GPU memory populated by the Zig loader
 
-## 2. Component Responsibilities & Tech Stack
-
-| Component               | Responsibility                                                           | Tech Stack               |
-| ----------------------- | ------------------------------------------------------------------------ | ------------------------ |
-| **Client**              | Sends OpenAI-spec inference requests                                     | Any (Python/JS/etc.)     |
-| **API Gateway**         | Receives `/v1/...` calls, handles authentication                         | Rust (Tokio + warp)      |
-| **Scheduler**           | Picks best Agent by cache_level, kv_hit_rate, queue_len, startup_cost    | Rust                     |
-| **Model Ingestion**     | On-demand HF raw checkpoint → Convert → Upload optimized (`.idx`+`.bin`) | Python + Rust lib        |
-| **Fan-out Downloader**  | Parallel HTTP-Range download into Agents’ NVMe                           | Rust                     |
-| **Metadata Store (KV)** | Stores `model_id → [{agent_id, cache_level, kv_hit_rate, queue_len}]`    | etcd (Go) or Redis       |
-| **Checkpoint Store**    | Holds optimized artifacts (`.idx`, `.bin`)                               | S3 / Azure Blob / HF Hub |
-| **Agent Daemon**        |
-
-• Heartbeat to KV  
- • Download Queue worker  
- • Multi-Tier Loader (Zig)  
- • Inference μService (Rust) | Rust + Zig |
-| **Multi-Tier Loader** | DRAM / NVMe / S3 → pinned buffer → CUDA DMA → GPU memory | Zig (direct syscalls) |
-| **Inference μService** | Exposes OpenAI endpoints, calls backend adapters (vLLM/Triton/others) | Rust + FFI (C++/Py) |
-| **Monitoring** | Prometheus metrics (load times, kv hits, queue lengths) | Prometheus / Grafana |
-| **CI/CD Pipeline** | Trains/fine-tunes → Checkpoint conversion → Upload optimized artifacts | GitHub Actions / Jenkins |
+5. **Client**  
+   • Any HTTP/gRPC client speaking the OpenAI API spec (e.g., Python, JavaScript, Go)
 
 ---
 
-## 3. Request Flow
+## 2. Data & Control Flow
 
-1. **Client** → API Gateway:  
-   `POST /v1/chat/completions` (OpenAI spec)
-
-2. **API Gateway** → Scheduler:  
-   • Check Metadata Store for agents with `model_id`  
-   • If no optimized files in Checkpoint Store, invoke Model Ingestion  
-   • Compute `score(agent)` = α·cache_level – β·kv_hit + γ·queue_len + δ·(size/bw)  
-   • Select Agent A
-
-3. **Scheduler** → Fan-out Downloader:  
-   • If no agent has model in DRAM/NVMe, download `.bin` chunks in parallel into N agents
-
-4. **Scheduler** → Agent A:  
-   `POST /load {model_id}`
-
-5. **Agent A**  
-   a. **Loader** (Zig): multi-tier read → GPU  
-   b. **Inference μService** (Rust): serves chat completion, updates kv_hit_rate
-
-6. **Agent A** → API Gateway:  
-   Streams tokens back (SSE/gRPC)
-
-7. **API Gateway** → Client:  
-   Proxies token stream as OpenAI spec
+1. **Client** → **Orchestrator**: `POST /v1/chat/completions` with `{model_id, prompt…}`
+2. **Orchestrator**:
+   - Check local metadata for agents with `model_id` cached in DRAM/NVMe
+   - If optimized files not in Checkpoint Store, download raw HF checkpoint and convert to `.idx`/`.bin` in-process
+   - If no agent has a hot cache, issue parallel HTTP-Range download tasks to agents’ download queues
+   - Compute `score(agent)` and select the best agent
+   - If agent has not loaded the model, send `LoadModel(model_id)` RPC
+   - Call `Infer(request)` RPC on agent; stream tokens back to client
+3. **Agent**:
+   - Heartbeat metadata to orchestrator
+   - Process download tasks: write chunks to NVMe
+   - On `LoadModel`: Zig loader stages chunks → GPU
+   - On `Infer(request)`: forward to vLLM, collect tokens, update kv_hit_rate, stream back over gRPC
+4. **vLLM**: uses GPU memory to generate tokens
 
 ---
 
-## 4. Next Steps & Extension Points
+## 3. Why Go & Zig?
 
-- **Multi-Backend Adapters**: easily add new inference engines
-- **Live Migration**: zero-downtime in-flight inference moves
-- **Layered Shard Streaming**: overlap load + infer
-- **P2P / RDMA**: peer fetch of chunks
-- **Quantization**: compressed weights + on-GPU decompress
-- **Autoscaling**: popularity predictor + agent pool scaling
-- **QoS**: tenant isolation, rate limiting
-- **Observability**: eBPF telemetry, Grafana dashboards
+- **Go** provides a single binary for both orchestrator and agent control logic, easy concurrency, and fast development.
+- **Zig** enables zero-overhead, no-GC data-plane for multi-tier checkpoint loading with direct syscalls and CUDA FFI.
+- **vLLM** remains the high-performance inference engine without reimplementation.
+
+---
+
+## 4. Scalability & Extensibility
+
+- **Horizontal scaling**: run multiple orchestrators behind a load-balancer; agents auto-register via heartbeat.
+- **Pluggable inference**: while MVP uses vLLM, new backends can be integrated by extending the Agent’s gRPC adapter.
+- **Future roadmap**: live migration, layered loading, P2P chunk sharing, quantization—each can be added without splitting services.
