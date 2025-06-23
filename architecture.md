@@ -27,7 +27,7 @@ A low-latency, OpenAI-compatible serverless LLM inference system using only Go a
    - Metrics: expose Prometheus metrics for request latencies, cache hits, scheduling decisions
 
 2. **Agent Daemon**  
-   • Languages: Go (control plane) + Zig (data plane loader)  
+   • Languages: Zig
    • Responsibilities:
 
    - Heartbeat over gRPC to orchestrator with `{agent_id, model_id, cache_level, kv_hit_rate, queue_len}`
