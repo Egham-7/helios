@@ -4,6 +4,7 @@
   * [ ] Basic request routing by model ID
   * [ ] Cache memory profiles and resource requirements
   * [ ] Kubernetes integration for querying workers
+  * [ ] Initial implementation of OpenTelemetry for standardized tracing and metrics
   * [ ] Basic resource allocation decisions
 * [ ] Develop Memory Estimator Service (Go)
   * [ ] Core memory calculation algorithms for inference/training
@@ -18,7 +19,7 @@
 * [ ] Implement vLLM Worker (Python)
   * [ ] Basic prefill and decode workers
   * [ ] Simple batching and token streaming
-  * [ ] Memory-aware batch sizing
+  * [ ] Memory-aware batch sizing based on direct feedback from Memory Estimator
 * [ ] Build basic Zig Storage Layer
   * [ ] Async file IO and model loading
   * [ ] Single-tier local NVMe caching
@@ -36,8 +37,8 @@
   * [ ] Memory-aware worker pool sizing
   * [ ] Intelligent model preloading based on memory availability
 * [ ] Enable circuit breaking and retry logic in Proxy
-* [ ] Implement GPU bin-packing with memory constraint awareness
-* [ ] Integrate Horizontal Pod Autoscaler with memory estimator feedback
+* [ ] Implement GPU bin-packing with co-location based on memory constraint awareness
+* [ ] Integrate Horizontal Pod Autoscaler with custom memory pressure metrics from estimator
 * [ ] Extend Storage Layer for multi-tier caching (add SSD tier)
 * [ ] Improve vLLM batching with memory-constrained dynamic sizing
 * [ ] Add Memory Estimator metrics to Prometheus dashboards
@@ -45,11 +46,11 @@
 
 ### Phase 3: Advanced Memory Optimization & Performance (1-2 months)
 * [ ] Enhance Memory Estimator with advanced features
-  * [ ] Support for different precision modes (FP32/FP16/INT8/INT4)
+  * [ ] Support for different precision modes (FP16, AWQ, GPTQ, INT8/INT4)
   * [ ] KV cache size estimation and overflow prediction
-  * [ ] Multi-GPU parallelism memory planning
+  * [ ] Multi-GPU parallelism memory planning (Tensor/Pipeline/Sequence)
   * [ ] Fine-tuning and training memory calculations
-* [ ] Implement zero-copy safetensors memory-mapped model loading in Zig
+* [ ] Implement zero-copy `safetensors` memory-mapped model loading in Zig
 * [ ] Add memory-aware mixed-precision inference in vLLM workers
   * [ ] Automatic precision selection based on memory constraints
   * [ ] Dynamic quantization for memory optimization
@@ -59,13 +60,13 @@
   * [ ] GPU RAM, host RAM, NVMe spillover based on estimator recommendations
   * [ ] Access pattern-aware cache placement
 * [ ] Add predictive prefetching with memory capacity planning
-* [ ] Enhance Kubernetes scheduling with memory-aware GPU MIG support
+* [ ] Enhance Kubernetes scheduling with memory-aware GPU MIG (Multi-Instance GPU) support
 
 ### Phase 4: Resilience, Observability & Memory Intelligence (1 month)
 * [ ] Add distributed tracing with memory allocation tracking
   * [ ] End-to-end request tracing including memory estimation
-  * [ ] Memory usage patterns and optimization opportunities
-* [ ] Implement advanced circuit breakers with memory pressure awareness
+  * [ ] Identify memory usage patterns and auto-suggest optimizations
+* [ ] Implement advanced circuit breakers with direct memory pressure awareness
 * [ ] Add comprehensive memory metrics and alerting
   * [ ] GPU memory utilization and pressure alerts
   * [ ] Memory estimation accuracy tracking
@@ -74,17 +75,17 @@
 * [ ] Implement admin endpoints for memory-aware operations
   * [ ] Manual scaling with memory validation
   * [ ] Intelligent cache eviction based on memory requirements
-  * [ ] Memory optimization recommendations
+  * [ ] Expose memory optimization recommendations via API
 * [ ] Develop memory pressure-based load shedding
 * [ ] Add capacity planning dashboards with memory projections
 
 ### Phase 5: Production Scalability & Memory Optimization (1+ months)
 * [ ] Implement cluster autoscaler with memory-aware node selection
   * [ ] Automatic GPU node provisioning based on memory requirements
-  * [ ] Heterogeneous GPU support (A100, H100, V100) with memory profiling
+  * [ ] Heterogeneous GPU support (A100, H100, etc.) with live memory profiling
 * [ ] Support multi-region deployment with memory-aware edge caching
 * [ ] Advanced Memory Estimator features
-  * [ ] Machine learning-based memory prediction improvements
+  * [ ] Self-improving ML model for memory prediction based on historical usage
   * [ ] Historical usage pattern analysis for optimization
   * [ ] Cost optimization recommendations based on memory efficiency
 * [ ] Perform comprehensive load testing with memory constraint validation
@@ -96,17 +97,18 @@
 
 ---
 ## Summary Timeline
-| Phase | Focus                           | Duration   | Key Memory Features                                    |
-| ----- | ------------------------------- | ---------- | ----------------------------------------------------- |
-| 1     | Core infra & memory foundations | 1-2 months | Basic memory estimation, config parsing, API setup    |
-| 2     | Memory-aware scheduling         | 1 month    | Resource planning, OOM prevention, constraint-aware autoscaling |
-| 3     | Advanced memory optimization    | 1-2 months | Multi-tier caching, precision optimization, parallelism planning |
-| 4     | Memory intelligence & monitoring| 1 month    | Comprehensive metrics, pressure-aware load shedding, optimization recommendations |
-| 5     | Production memory efficiency    | 1+ months  | ML-based optimization, cost efficiency, heterogeneous GPU support |
+| Phase | Focus | Duration | Key Memory Features |
+|---|---|---|---|
+| 1 | Core infra & memory foundations | 1-2 months | Basic memory estimation, OpenTelemetry, API setup |
+| 2 | Memory-aware scheduling | 1 month | GPU bin-packing, OOM prevention, constraint-aware HPA |
+| 3 | Advanced memory optimization | 1-2 months | Quantization (AWQ/GPTQ), mmap loading, multi-tier KV cache |
+| 4 | Memory intelligence & monitoring| 1 month | Memory tracing, pressure-aware load shedding, optimization API |
+| 5 | Production memory efficiency | 1+ months | Self-improving ML estimation, cost efficiency, heterogeneous GPU support |
 
 ## Key Success Metrics
-* **Memory Efficiency:** >95% GPU memory utilization without OOM errors
-* **Estimation Accuracy:** <5% difference between predicted and actual memory usage
-* **Cold Start Performance:** <30 seconds for largest models with memory validation
-* **Resource Optimization:** 20-30% cost reduction through intelligent memory management
+* **Memory Efficiency:** >90% average GPU memory utilization without OOM errors
+* **Estimation Accuracy:** <5% P99 difference between predicted and actual memory usage
+* **OOM Incident Rate:** <0.01% of inference requests result in an OOM error
+* **Cold Start Performance:** <20 seconds P95 for largest models with memory validation
+* **Resource Optimization:** 25-40% cost reduction through intelligent memory management
 * **Scalability:** Support for 1000+ concurrent models with dynamic memory allocation
